@@ -235,9 +235,10 @@ mod tests {
     fn prepends_library_dir() {
         let dir = Path::new("/opt/semantix/lib");
         assert_eq!(prepend_search_path(dir, None), "/opt/semantix/lib");
+        let sep = search_path_sep();
         assert_eq!(
             prepend_search_path(dir, Some("/usr/lib")),
-            "/opt/semantix/lib:/usr/lib"
+            format!("/opt/semantix/lib{sep}/usr/lib")
         );
     }
 }

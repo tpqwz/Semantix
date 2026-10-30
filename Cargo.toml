@@ -14,7 +14,7 @@ path = "src/main.rs"
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4.5", features = ["derive"] }
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "x11", "clipboard"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard"] }
 half = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 libloading = "0.8"
@@ -22,13 +22,17 @@ memmap2 = "0.9"
 ndarray = "0.17"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "half", "load-dynamic", "cuda", "api-22", "preload-dylibs"] }
 regex = "1"
-rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "async-std"] }
+rfd = { version = "0.15.4", default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 walkdir = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["x11"] }
+rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "async-std"] }
 
 [profile.release]
 lto = "thin"

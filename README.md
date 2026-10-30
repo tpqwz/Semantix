@@ -82,11 +82,13 @@ Default data directory:
 
 `--data` and `SEMANTIX_DATA` override that.
 
-## Portable Linux folder
+## Portable folder
 
-`pack.sh` builds a release binary and copies the CPU ONNX Runtime library (not the CUDA stack) into `dist/semantix-linux-x64/`. It also copies models when `SEMANTIX_MODELS` or `./models` already has them. The `portable` marker makes that folder self-contained.
+`pack.sh` builds a release binary for this machine and writes `dist/semantix-<platform>/`. The folder contains the binary, a `portable` marker, and the CPU ONNX Runtime 1.22 library. CUDA libraries are not included. If `SEMANTIX_RUNTIME`, `runtime/lib`, or a Starlign checkout next to this crate does not already hold that library, the script downloads the official CPU archive from the ONNX Runtime GitHub release.
 
-Windows and macOS use the same crate. This tree packages the OS it is built on.
+Models are not packed unless `SEMANTIX_MODELS` or `./models` already has them. A portable executable downloads them on its own. `semantix fetch-models`, or the Download models button, writes the verified files under `data/models` next to the binary. A file whose SHA-256 already matches is skipped, and later runs stay offline.
+
+GitHub Actions runs that pack for Linux x64, Windows x64, and macOS arm64 on every push to `main`. A `v*` tag also publishes the folders as a release. The weights are still fetched by the executable, not stored in the archive.
 
 ## License
 
