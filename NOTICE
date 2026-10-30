@@ -1,0 +1,22 @@
+Semantix
+Copyright (c) 2026 tpqwz
+
+This application is MIT licensed. See the repository LICENSE.
+
+Third-party components used by Semantix, not vendored as source unless noted:
+
+- ONNX Runtime, MIT License, Microsoft and contributors.
+  Loaded at runtime. Not copied into this source tree.
+
+- PaddleOCR PP-OCRv5 / PP-OCRv4 models and the English recognition
+  dictionary, Apache License 2.0, PaddlePaddle / RapidAI.
+  `assets/ppocrv5_en_dict.txt` is the English PP-OCRv5 dictionary
+  (ppocrv5_en_dict.txt). The ONNX graphs are downloaded, not committed.
+
+- OpenAI CLIP ViT-B/32, MIT License, OpenAI.
+  The quantized ONNX graph, vocab.json, and merges.txt used here are the
+  Xenova/clip-vit-base-patch32 export. CLIP is used instead of MobileCLIP
+  so the default semantic model stays under a standard permissive license.
+
+SQLite is compiled by the `rusqlite` `bundled` feature. SQLite is in the
+public domain.
