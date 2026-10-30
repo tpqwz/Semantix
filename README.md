@@ -6,7 +6,7 @@ Offline desktop gallery. Point it at a folder of photos, screenshots, and scans.
 
 Nothing leaves the computer after the models are present. There is no account and no telemetry.
 
-The window is [egui](https://github.com/emilk/egui). Indexing, ONNX Runtime, SQLite, and embedding search live in this Rust crate. A portable folder is a binary plus `libonnxruntime`, with a `portable` marker so the library sits next to the executable.
+The window is [egui](https://github.com/emilk/egui). Indexing, ONNX Runtime, SQLite, and embedding search live in this Rust crate. The portable program is the binary. A `portable` file beside it keeps the library data next to the executable. The binary downloads ONNX Runtime and the models when they are not already on disk.
 
 ## Build
 
@@ -15,14 +15,15 @@ cd semantix
 cargo build --release
 ```
 
-ONNX Runtime is loaded at startup from, in order:
+ONNX Runtime is loaded from the first of these that already contains the library:
 
 - `SEMANTIX_RUNTIME`
 - `lib/` or `runtime/lib/` next to the executable
+- `lib/` inside the data directory
 - `runtime/lib/` inside this crate
 - `../st/starlign/runtime/lib` when this crate sits in `~/code` next to the Starlign checkout
 
-CPU inference needs `libonnxruntime` only. `--cuda` also looks for the CUDA provider libraries in that same directory. If CUDA session setup fails, restart without `--cuda`. This process will not open a replacement CPU session after that failure.
+If none of those exist, the first OCR or CLIP load downloads the official CPU ONNX Runtime 1.22 archive, checks its SHA-256, and saves the library. A writable folder next to the executable gets `lib/`. Otherwise the file goes under the data directory. CUDA provider libraries are not downloaded. `--cuda` uses them only when they are already in that same directory. If CUDA session setup fails, restart without `--cuda`. This process will not open a replacement CPU session after that failure.
 
 ## Models
 
@@ -82,13 +83,11 @@ Default data directory:
 
 `--data` and `SEMANTIX_DATA` override that.
 
-## Portable folder
+## Portable executable
 
-`pack.sh` builds a release binary for this machine and writes `dist/semantix-<platform>/`. The folder contains the binary, a `portable` marker, and the CPU ONNX Runtime 1.22 library. CUDA libraries are not included. If `SEMANTIX_RUNTIME`, `runtime/lib`, or a Starlign checkout next to this crate does not already hold that library, the script downloads the official CPU archive from the ONNX Runtime GitHub release.
+The release build is the `semantix` binary. It does not need a pack step. Put an empty `portable` file beside it when the database and thumbnails should stay in `data/` next to that binary. The first time OCR or CLIP runs, the binary downloads ONNX Runtime and, if you use Download models or `semantix fetch-models`, the model files. Both are hash-checked. A later launch uses the copies on disk and does not touch the network.
 
-Models are not packed unless `SEMANTIX_MODELS` or `./models` already has them. A portable executable downloads them on its own. `semantix fetch-models`, or the Download models button, writes the verified files under `data/models` next to the binary. A file whose SHA-256 already matches is skipped, and later runs stay offline.
-
-GitHub Actions runs that pack for Linux x64, Windows x64, and macOS arm64 on every push to `main`. A `v*` tag also publishes the folders as a release. The weights are still fetched by the executable, not stored in the archive.
+GitHub Actions builds that binary for Linux x64, Windows x64, and macOS arm64 on every push to `main`. A `v*` tag publishes it. The archive is the executable, not the weights or the runtime.
 
 ## License
 

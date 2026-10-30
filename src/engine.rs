@@ -652,7 +652,12 @@ impl Engine {
         let env = match self.env.clone() {
             Some(env) => env,
             None => match runtime::environment(self.cfg.cuda) {
-                Ok(env) => env,
+                Ok(env) => {
+                    if let Some(note) = runtime::acquired_note() {
+                        self.note(note);
+                    }
+                    env
+                }
                 Err(err) => {
                     self.frozen = true;
                     self.note(format!(

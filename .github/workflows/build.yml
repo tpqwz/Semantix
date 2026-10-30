@@ -29,13 +29,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
         run: cargo test
-      - name: Pack portable folder
+      - name: Build
+        run: cargo build --release
+      - name: Stage the executable
         shell: bash
-        run: bash ./pack.sh
+        run: |
+          set -eu
+          mkdir -p dist
+          if [ -f target/release/semantix.exe ]; then
+            cp target/release/semantix.exe dist/semantix.exe
+          else
+            cp target/release/semantix dist/semantix
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: dist/semantix*
           if-no-files-found: error
 
   release:

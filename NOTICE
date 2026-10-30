@@ -6,7 +6,8 @@ This application is MIT licensed. See the repository LICENSE.
 Third-party components used by Semantix, not vendored as source unless noted:
 
 - ONNX Runtime, MIT License, Microsoft and contributors.
-  Loaded at runtime. Not copied into this source tree.
+  Loaded at runtime. Not copied into this source tree. The application
+  downloads the official 1.22 CPU archive when a copy is not already present.
 
 - PaddleOCR PP-OCRv5 / PP-OCRv4 models and the English recognition
   dictionary, Apache License 2.0, PaddlePaddle / RapidAI.
