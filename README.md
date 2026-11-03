@@ -1,6 +1,6 @@
 # Semantix
 
-Version 0.1.0-alpha.1.
+Version 0.1.0-alpha.2.
 
 Offline desktop gallery. Point it at a folder of photos, screenshots, and scans. It indexes them on this machine: thumbnails, EXIF, PaddleOCR text, and CLIP embeddings. Search a receipt number, describe a picture, or drop an image to find similar ones.
 
