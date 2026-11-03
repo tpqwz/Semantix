@@ -19,27 +19,45 @@ jobs:
         include:
           - os: ubuntu-22.04
             artifact: semantix-linux-x64
+            target: ""
           - os: windows-latest
             artifact: semantix-win-x64
-          - os: macos-latest
+            target: ""
+          # Hosted arm64 Macs are not being assigned. The Intel image
+          # cross-compiles the same aarch64-apple-darwin executable.
+          - os: macos-15-intel
             artifact: semantix-osx-arm64
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - name: Test
         run: cargo test
       - name: Build
-        run: cargo build --release
+        shell: bash
+        run: |
+          set -eu
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --target "${{ matrix.target }}"
+          else
+            cargo build --release
+          fi
       - name: Stage the executable
         shell: bash
         run: |
           set -eu
           mkdir -p dist
-          if [ -f target/release/semantix.exe ]; then
-            cp target/release/semantix.exe dist/semantix.exe
+          root=target/${{ matrix.target }}/release
+          if [ -z "${{ matrix.target }}" ]; then
+            root=target/release
+          fi
+          if [ -f "$root/semantix.exe" ]; then
+            cp "$root/semantix.exe" dist/semantix.exe
           else
-            cp target/release/semantix dist/semantix
+            cp "$root/semantix" dist/semantix
           fi
       - uses: actions/upload-artifact@v4
         with:
