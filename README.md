@@ -87,7 +87,7 @@ Default data directory:
 
 The release build is the `semantix` binary. It does not need a pack step. Put an empty `portable` file beside it when the database and thumbnails should stay in `data/` next to that binary. The first time OCR or CLIP runs, the binary downloads ONNX Runtime and, if you use Download models or `semantix fetch-models`, the model files. Both are hash-checked. A later launch uses the copies on disk and does not touch the network.
 
-GitHub Actions builds that binary for Linux x64, Windows x64, and macOS arm64 on every push to `main`. A `v*` tag publishes it. The archive is the executable, not the weights or the runtime.
+GitHub Actions builds that binary for Linux x64, Windows x64, and macOS arm64 on every push to `main`. A `v*` tag publishes the executable itself: `semantix-linux-x64`, `semantix-osx-arm64`, and `semantix-win-x64.exe`. Weights and the runtime are not in the download. On Linux and macOS, `chmod +x` the file before the first launch.
 
 ## License
 

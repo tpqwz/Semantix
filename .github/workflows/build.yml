@@ -75,15 +75,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-      - name: Archive each folder
+      - name: Name each executable
         shell: bash
         run: |
           set -eu
-          cd dist
-          for dir in semantix-*; do
-            tar -czf "$dir.tar.gz" "$dir"
-          done
+          mkdir -p publish
+          cp dist/semantix-linux-x64/semantix publish/semantix-linux-x64
+          cp dist/semantix-osx-arm64/semantix publish/semantix-osx-arm64
+          cp dist/semantix-win-x64/semantix.exe publish/semantix-win-x64.exe
+          chmod +x publish/semantix-linux-x64 publish/semantix-osx-arm64
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: publish/semantix-*
           generate_release_notes: true
