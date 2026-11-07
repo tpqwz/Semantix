@@ -162,7 +162,11 @@ fn clip_tensor(image: &RgbImage) -> Array4<f32> {
     let height = image.height() as usize;
     let width = image.width() as usize;
     let mut dest = Array4::<f32>::zeros((1, 3, height, width));
+    // Published OpenCLIP / OpenAI normalization. The extra digits are the
+    // constants the model was trained with, kept as written.
+    #[allow(clippy::excessive_precision)]
     const MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+    #[allow(clippy::excessive_precision)]
     const STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
     for y in 0..height {
         for x in 0..width {

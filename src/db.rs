@@ -824,7 +824,7 @@ mod tests {
             size: 10,
             mtime_ns: 5,
         };
-        db.rescan(root, &[file.clone()]).unwrap();
+        db.rescan(root, std::slice::from_ref(&file)).unwrap();
         let id = db.pending(Some(root), true, true).unwrap()[0];
         db.set_decoded(id, "abc", 8, 8, "{}", "ab/abc.jpg").unwrap();
         db.set_ocr(id, "hello", "stamp").unwrap();

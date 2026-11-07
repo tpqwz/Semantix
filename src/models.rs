@@ -100,7 +100,14 @@ pub fn fetch(dir: &Path, mut note: impl FnMut(&str)) -> Result<ModelStatus> {
 
 fn download(dest: &Path, file: &ModelFile) -> Result<()> {
     let partial = partial_path(dest);
-    let response = ureq::get(file.url)
+    // A quiet socket fails. Bytes that keep arriving do not, so a large
+    // graph can finish on a slow link.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(30))
+        .timeout_read(std::time::Duration::from_secs(120))
+        .build();
+    let response = agent
+        .get(file.url)
         .call()
         .map_err(|err| anyhow!("GET {}: {err}", file.url))?;
     let mut reader = response.into_reader();

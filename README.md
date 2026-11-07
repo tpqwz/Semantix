@@ -6,6 +6,18 @@ Offline desktop gallery. Point it at a folder of photos, screenshots, and scans.
 
 Nothing leaves the computer after the models are present. There is no account and no telemetry.
 
+## Download
+
+[v0.1.0-alpha.2](https://github.com/tpqwz/semantix/releases/tag/v0.1.0-alpha.2) is one executable per platform. The file is the program.
+
+| Platform | File |
+| --- | --- |
+| Linux x64 | [semantix-linux-x64](https://github.com/tpqwz/semantix/releases/download/v0.1.0-alpha.2/semantix-linux-x64) |
+| macOS arm64 | [semantix-osx-arm64](https://github.com/tpqwz/semantix/releases/download/v0.1.0-alpha.2/semantix-osx-arm64) |
+| Windows x64 | [semantix-win-x64.exe](https://github.com/tpqwz/semantix/releases/download/v0.1.0-alpha.2/semantix-win-x64.exe) |
+
+On Linux and macOS, `chmod +x` the download before the first launch. The first OCR or CLIP run downloads ONNX Runtime. Download models, or `semantix fetch-models`, downloads the model files. Both are checked against a published SHA-256.
+
 The window is [egui](https://github.com/emilk/egui). Indexing, ONNX Runtime, SQLite, and embedding search live in this Rust crate. The portable program is the binary. A `portable` file beside it keeps the library data next to the executable. The binary downloads ONNX Runtime and the models when they are not already on disk.
 
 ## Build

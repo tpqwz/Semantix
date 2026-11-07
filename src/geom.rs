@@ -15,7 +15,7 @@ pub struct RotRect {
 pub fn convex_hull(points: &[(f32, f32)]) -> Vec<(f32, f32)> {
     let mut pts = points.to_vec();
     pts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-    pts.dedup_by(|a, b| (*a).0 == (*b).0 && (*a).1 == (*b).1);
+    pts.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     if pts.len() <= 2 {
         return pts;
     }

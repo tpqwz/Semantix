@@ -368,7 +368,10 @@ fn download_runtime_to(dir: &Path) -> Result<()> {
 
 fn download_verified(url: &str, dest: &Path, sha256: &str) -> Result<()> {
     let partial = dest.with_extension("partial");
-    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(300)).build();
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(30))
+        .timeout_read(std::time::Duration::from_secs(120))
+        .build();
     let response = agent.get(url).call().map_err(|err| anyhow!("GET {url}: {err}"))?;
     let mut reader = response.into_reader();
     let mut out = std::fs::File::create(&partial)?;

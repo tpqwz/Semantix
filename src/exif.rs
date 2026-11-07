@@ -480,7 +480,7 @@ mod tests {
             taken_ns(r#"{"datetime":"1972:06:30 23:59:60"}"#),
             taken_ns(r#"{"datetime":"1972:06:30 23:59:59"}"#)
         );
-        assert_eq!(taken_ns(r#"{"datetime":"2020:02:29 00:00:00"}"#).is_some(), true);
+        assert!(taken_ns(r#"{"datetime":"2020:02:29 00:00:00"}"#).is_some());
         assert_eq!(taken_ns(r#"{"datetime":"2019:02:29 00:00:00"}"#), None);
         assert_eq!(taken_ns(r#"{"datetime":"0000:00:00 00:00:00"}"#), None);
         assert_eq!(taken_ns(r#"{"orientation":1}"#), None);

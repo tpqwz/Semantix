@@ -887,7 +887,7 @@ impl GalleryApp {
             return;
         }
         let avail = ui.available_size();
-        let scale = (avail.x / size.x).min(avail.y / size.y).min(1.0).max(0.01);
+        let scale = (avail.x / size.x).min(avail.y / size.y).clamp(0.01, 1.0);
         let draw = size * scale;
         let (rect, _) = ui.allocate_exact_size(draw, egui::Sense::hover());
         ui.painter().image(
@@ -939,6 +939,7 @@ impl GalleryApp {
                 let mut ocr = detail.ocr.clone();
                 ui.add(
                     egui::TextEdit::multiline(&mut ocr)
+                        .interactive(false)
                         .desired_width(f32::INFINITY)
                         .desired_rows(8),
                 );
@@ -1188,6 +1189,16 @@ fn group_number(snippet: &str) -> Option<usize> {
     (number > 0).then_some(number)
 }
 
+fn exif_lines(json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return vec![json.to_string()];
+    };
+    let Some(object) = value.as_object() else {
+        return vec![json.to_string()];
+    };
+    object.iter().map(|(key, value)| format!("{key}: {value}")).collect()
+}
+
 fn frame_source(exif_json: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(exif_json).ok()?;
     let source = value.get("source")?.as_str()?.trim();
@@ -1217,14 +1228,4 @@ mod tests {
         );
         assert!(frame_source("{}").is_none());
     }
-}
-
-fn exif_lines(json: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return vec![json.to_string()];
-    };
-    let Some(object) = value.as_object() else {
-        return vec![json.to_string()];
-    };
-    object.iter().map(|(key, value)| format!("{key}: {value}")).collect()
 }
