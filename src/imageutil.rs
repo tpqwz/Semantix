@@ -105,6 +105,41 @@ pub(crate) fn read_photo(path: &Path, secs: u64) -> PhotoRead {
 
 /// A local read that must not sit forever. pCloud files do not come through here.
 pub(crate) fn read_within(path: &Path, secs: u64) -> Option<Vec<u8>> {
+    if gnu_timeout() {
+        return read_with_gnu_timeout(path, secs);
+    }
+    // Windows `timeout` is a different program, and macOS does not ship GNU
+    // timeout. Abandon the read from this thread instead of failing the open.
+    let path = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let bytes = std::fs::read(&path).ok().filter(|bytes| !bytes.is_empty());
+        let _ = tx.send(bytes);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs)).ok().flatten()
+}
+
+fn gnu_timeout() -> bool {
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *READY.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            false
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("timeout")
+                .args(["--signal=KILL", "1", "true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+    })
+}
+
+fn read_with_gnu_timeout(path: &Path, secs: u64) -> Option<Vec<u8>> {
     let output = std::process::Command::new("timeout")
         .args(["--signal=KILL", &secs.to_string(), "cat", "--"])
         .arg(path)
