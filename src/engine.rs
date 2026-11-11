@@ -6,7 +6,7 @@
 use crate::clip::Clip;
 use crate::config::{self, Config};
 use crate::db::{Library, ScanFile};
-use crate::embed::Store;
+use crate::embed::{group_slots, Store};
 use crate::imageutil::{self, Decoded};
 use crate::models;
 use crate::ocr::Ocr;
@@ -31,6 +31,8 @@ pub struct Progress {
     pub paused: bool,
     /// This file's CLIP vector was stored on this step.
     pub embedded: bool,
+    /// Text was stored for this photo on this step.
+    pub recognized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -934,6 +936,11 @@ fn dispatch(
             if let Err(err) = preview_controlled(engine, rx, ev, pause, cancel, deferred) {
                 let _ = ev.send(Event::Error(format!("{err:#}")));
             }
+            if !cancel.load(Ordering::Relaxed) {
+                if let Err(err) = recognize_pending(engine, rx, ev, pause, cancel, deferred) {
+                    let _ = ev.send(Event::Error(format!("{err:#}")));
+                }
+            }
             let _ = ev.send(Event::Idle);
             send_shelf(engine, ev);
         }
@@ -1002,14 +1009,17 @@ fn dispatch(
                 let _ = ev.send(Event::Error(format!("{err:#}")));
             }
         },
-        Cmd::Duplicates { gen, threshold, limit } => match engine.duplicates(threshold, limit) {
-            Ok(hits) => {
-                let _ = ev.send(Event::Hits { gen, hits });
+        Cmd::Duplicates { gen, threshold, limit } => {
+            match duplicates_yielding(engine, threshold, limit, rx, ev, cancel, deferred) {
+                Ok(Some(hits)) => {
+                    let _ = ev.send(Event::Hits { gen, hits });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let _ = ev.send(Event::Error(format!("{err:#}")));
+                }
             }
-            Err(err) => {
-                let _ = ev.send(Event::Error(format!("{err:#}")));
-            }
-        },
+        }
         Cmd::SaveSearch { name, mode, query } => {
             if let Err(err) = engine.save_search(&name, mode, &query) {
                 let _ = ev.send(Event::Error(format!("{err:#}")));
@@ -1199,6 +1209,7 @@ fn preview_controlled(
                 path,
                 paused: pause.load(Ordering::Relaxed),
                 embedded,
+                recognized: false,
             }));
             drain_interactive(engine, rx, ev, cancel, deferred);
             if cancel.load(Ordering::Relaxed)
@@ -1244,13 +1255,16 @@ fn index_controlled(
                 return Ok(());
             }
             let path = engine.index_one(id)?;
-            let embedded = engine.db.get(id).map(|row| row.embed_status == "done").unwrap_or(false);
+            let row = engine.db.get(id).ok();
+            let embedded = row.as_ref().map(|row| row.embed_status == "done").unwrap_or(false);
+            let recognized = row.as_ref().map(|row| row.ocr_status == "done").unwrap_or(false);
             let _ = ev.send(Event::Progress(Progress {
                 done: index as u32 + 1,
                 total,
                 path,
                 paused: false,
                 embedded,
+                recognized,
             }));
         }
         if !cancel.load(Ordering::Relaxed) {
@@ -1258,6 +1272,127 @@ fn index_controlled(
         }
     }
     Ok(())
+}
+
+/// OCR for photos already in the library. Does not walk the folders again.
+fn recognize_pending(
+    engine: &mut Engine,
+    rx: &Receiver<Cmd>,
+    ev: &Sender<Event>,
+    pause: &AtomicBool,
+    cancel: &AtomicBool,
+    deferred: &mut std::collections::VecDeque<Cmd>,
+) -> Result<()> {
+    if engine.ocr.is_none() {
+        return Ok(());
+    }
+    let ids = engine.db.pending(None, true, false)?;
+    let total = ids.len() as u32;
+    if total == 0 {
+        return Ok(());
+    }
+    let _ = ev.send(Event::Note(format!(
+        "reading text in {total} photos. Saved embeddings are kept."
+    )));
+    for (index, id) in ids.into_iter().enumerate() {
+        while pause.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+            drain_interactive(engine, rx, ev, cancel, deferred);
+            thread::sleep(Duration::from_millis(40));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        drain_interactive(engine, rx, ev, cancel, deferred);
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let path = engine.index_one(id)?;
+        let row = engine.db.get(id).ok();
+        let recognized = row.as_ref().map(|row| row.ocr_status == "done").unwrap_or(false);
+        let _ = ev.send(Event::Progress(Progress {
+            done: index as u32 + 1,
+            total,
+            path,
+            paused: false,
+            embedded: false,
+            recognized,
+        }));
+    }
+    Ok(())
+}
+
+/// Compare embeddings, but let a search through between photos. A newer
+/// duplicate request replaces this one instead of waiting behind it.
+fn duplicates_yielding(
+    engine: &mut Engine,
+    threshold: f32,
+    limit_groups: usize,
+    rx: &Receiver<Cmd>,
+    ev: &Sender<Event>,
+    cancel: &AtomicBool,
+    deferred: &mut std::collections::VecDeque<Cmd>,
+) -> Result<Option<Vec<Hit>>> {
+    let threshold = if threshold.is_finite() {
+        threshold.clamp(0.0, 1.0)
+    } else {
+        0.95
+    };
+    let slots = engine
+        .store
+        .as_ref()
+        .ok_or_else(|| anyhow!("CLIP is not loaded"))?
+        .occupied();
+    let preempted = |deferred: &std::collections::VecDeque<Cmd>| {
+        cancel.load(Ordering::Relaxed)
+            || deferred.iter().any(|cmd| {
+                matches!(
+                    cmd,
+                    Cmd::Duplicates { .. } | Cmd::Shutdown | Cmd::IndexPath(_) | Cmd::IndexAll
+                )
+            })
+    };
+    let Some(groups) = group_slots(&slots, threshold, |_| {
+        drain_interactive(engine, rx, ev, cancel, deferred);
+        !preempted(deferred)
+    }) else {
+        return Ok(None);
+    };
+    if preempted(deferred) {
+        return Ok(None);
+    }
+    let mut hits = Vec::new();
+    let mut shown = 0usize;
+    for group in groups {
+        if limit_groups == 0 || shown >= limit_groups {
+            break;
+        }
+        let mut members = Vec::new();
+        for id in group.ids {
+            let Ok(row) = engine.db.get(id) else { continue };
+            if row.present {
+                members.push(row);
+            }
+        }
+        if members.len() < 2 {
+            continue;
+        }
+        shown += 1;
+        let snippet = format!("group {shown} · {:.3}", group.score);
+        for row in members {
+            hits.push(Hit {
+                id: row.id,
+                path: row.path,
+                rel: row.rel,
+                thumb: row.thumb,
+                snippet: snippet.clone(),
+                score: group.score,
+                semantic: true,
+                width: row.width,
+                height: row.height,
+            });
+        }
+    }
+    Ok(Some(hits))
 }
 
 fn drain_interactive(
@@ -1298,14 +1433,7 @@ fn drain_interactive(
                     let _ = ev.send(Event::Error(format!("{err:#}")));
                 }
             },
-            Ok(Cmd::Duplicates { gen, threshold, limit }) => match engine.duplicates(threshold, limit) {
-                Ok(hits) => {
-                    let _ = ev.send(Event::Hits { gen, hits });
-                }
-                Err(err) => {
-                    let _ = ev.send(Event::Error(format!("{err:#}")));
-                }
-            },
+            Ok(cmd @ Cmd::Duplicates { .. }) => deferred.push_back(cmd),
             Ok(Cmd::SaveSearch { name, mode, query }) => {
                 if let Err(err) = engine.save_search(&name, mode, &query) {
                     let _ = ev.send(Event::Error(format!("{err:#}")));

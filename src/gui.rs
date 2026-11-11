@@ -92,7 +92,6 @@ struct GalleryApp {
     runtime: String,
     tab: Tab,
     query: String,
-    folder: String,
     cards: Vec<Card>,
     gallery: Vec<Item>,
     textures: TexCache,
@@ -127,6 +126,8 @@ struct GalleryApp {
     log: Vec<String>,
     log_open: bool,
     dup_threshold: f32,
+    /// Duplicate grouping is still running on the worker.
+    comparing: bool,
     show_frames: bool,
     folder_filter: Option<i64>,
 }
@@ -148,7 +149,6 @@ impl GalleryApp {
             runtime: String::new(),
             tab: Tab::Library,
             query: String::new(),
-            folder: String::new(),
             cards: Vec::new(),
             gallery: Vec::new(),
             textures: TexCache { map: HashMap::new(), order: VecDeque::new(), miss: HashSet::new() },
@@ -182,6 +182,7 @@ impl GalleryApp {
             log: Vec::new(),
             log_open: false,
             dup_threshold: 0.95,
+            comparing: false,
             show_frames: false,
             folder_filter: None,
         }
@@ -217,7 +218,13 @@ impl GalleryApp {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| progress.path.clone());
                     let state = if progress.paused { " paused" } else { "" };
-                    let wrote = if progress.embedded { " embedded" } else { "" };
+                    let wrote = if progress.embedded {
+                        " embedded"
+                    } else if progress.recognized {
+                        " text"
+                    } else {
+                        ""
+                    };
                     self.push_log(format!("{}/{} {name}{wrote}{state}", progress.done, progress.total));
                     self.running = true;
                     self.progress = Some(progress);
@@ -233,6 +240,7 @@ impl GalleryApp {
                     self.push_log(format!("{} matches", hits.len()));
                     if gen == self.gen && matches!(self.tab, Tab::Semantic | Tab::Hybrid | Tab::Duplicates) {
                         self.held_hits = hits;
+                        self.comparing = false;
                         self.apply_search_floor();
                         self.showing_hits = true;
                     }
@@ -408,9 +416,11 @@ impl GalleryApp {
     fn fire_duplicates(&mut self) {
         self.gen += 1;
         self.showing_hits = true;
+        self.comparing = true;
         self.query_dirty = false;
         self.leave_special_view();
         self.cards.clear();
+        self.push_log("Comparing embeddings. Typing filters the groups, and other searches still run.");
         self.handle.send(Cmd::Duplicates {
             gen: self.gen,
             threshold: self.dup_threshold,
@@ -515,9 +525,7 @@ impl GalleryApp {
                 continue;
             }
             if path.is_dir() {
-                self.folder = path.display().to_string();
-                self.running = true;
-                self.handle.send(Cmd::IndexPath(path));
+                self.index_folder(path);
             } else if imageutil::is_image(&path) {
                 self.gen += 1;
                 self.tab = Tab::Semantic;
@@ -720,7 +728,9 @@ impl eframe::App for GalleryApp {
             if search.changed() {
                 self.query = query;
                 self.query_at = Instant::now();
-                if !matches!(self.tab, Tab::Duplicates) {
+                if self.tab == Tab::Duplicates {
+                    self.apply_search_floor();
+                } else {
                     self.query_dirty = true;
                     self.showing_hits = false;
                     self.leave_special_view();
@@ -796,8 +806,23 @@ impl GalleryApp {
     fn apply_search_floor(&mut self) {
         let floor = self.search_floor;
         let duplicates = self.tab == Tab::Duplicates;
-        let hits = self.held_hits.iter().filter(|hit| duplicates || keep_match(hit.score, hit.semantic, floor)).cloned();
-        self.cards = hits.map(card_from_hit).collect();
+        let needle = self.query.trim().to_lowercase();
+        let mut named: HashSet<String> = HashSet::new();
+        if duplicates && !needle.is_empty() {
+            for hit in &self.held_hits {
+                if hit.path.to_lowercase().contains(&needle) || hit.rel.to_lowercase().contains(&needle) {
+                    named.insert(hit.snippet.clone());
+                }
+            }
+        }
+        let hits = self.held_hits.iter().filter(|hit| {
+            if duplicates {
+                needle.is_empty() || named.contains(&hit.snippet)
+            } else {
+                keep_match(hit.score, hit.semantic, floor)
+            }
+        });
+        self.cards = hits.cloned().map(card_from_hit).collect();
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
@@ -843,19 +868,18 @@ impl GalleryApp {
         }
     }
 
+    fn index_folder(&mut self, path: PathBuf) {
+        self.running = true;
+        self.progress = None;
+        self.handle.send(Cmd::IndexPath(path));
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("Folder");
-            ui.add(egui::TextEdit::singleline(&mut self.folder).desired_width(360.0).hint_text("Photos, screenshots, scans"));
-            if ui.button("Browse").clicked() {
+            if ui.add_enabled(!self.running, egui::Button::new("Browse")).clicked() {
                 if let Some(path) = rfd::FileDialog::new().set_title("Index folder").pick_folder() {
-                    self.folder = path.display().to_string();
+                    self.index_folder(path);
                 }
-            }
-            if ui.add_enabled(!self.folder.trim().is_empty() && !self.running, egui::Button::new("Index")).clicked() {
-                self.running = true;
-                self.progress = None;
-                self.handle.send(Cmd::IndexPath(PathBuf::from(self.folder.trim())));
             }
             let pause_label = if self.handle.paused() { "Resume" } else { "Pause" };
             if ui.add_enabled(self.running, egui::Button::new(pause_label)).clicked() {
@@ -904,7 +928,9 @@ impl GalleryApp {
             let hidden_frames = self.gallery.iter().any(|item| {
                 frame_rel(&item.rel) && self.folder_filter.is_none_or(|id| item.root_id == id)
             });
-            let message = if self.tab == Tab::Duplicates {
+            let message = if self.tab == Tab::Duplicates && self.comparing {
+                "Comparing embeddings…".to_string()
+            } else if self.tab == Tab::Duplicates {
                 format!("No near-duplicates at {:.2} cosine.", self.dup_threshold)
             } else if self.open_collection.is_some() {
                 "This collection is empty.".to_string()
@@ -913,7 +939,7 @@ impl GalleryApp {
             } else if self.tab == Tab::Library && self.folder_filter.is_some() {
                 "Nothing in this folder.".to_string()
             } else {
-                "No images yet. Choose a folder and index it.".to_string()
+                "No images yet. Browse to a folder.".to_string()
             };
             ui.label(message);
             return;

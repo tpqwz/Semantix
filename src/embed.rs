@@ -163,8 +163,12 @@ impl Store {
     /// A group needs at least two occupied slots at or above `threshold`.
     /// `score` is the strongest link inside the group.
     pub fn groups(&self, threshold: f32) -> Vec<Group> {
+        group_slots(&self.occupied(), threshold, |_| true).unwrap_or_default()
+    }
+
+    pub(crate) fn occupied(&self) -> Vec<(i64, f32, Vec<i8>)> {
         let dim = self.dim as usize;
-        let mut slots: Vec<(i64, f32, Vec<i8>)> = Vec::new();
+        let mut slots = Vec::new();
         for id in 1..self.capacity as i64 {
             let at = self.offset(id);
             let len = self.record_len();
@@ -184,32 +188,7 @@ impl Store {
             }
             slots.push((id, scale, quantized));
         }
-        let count = slots.len();
-        let mut parent: Vec<usize> = (0..count).collect();
-        let mut rank = vec![0u8; count];
-        let mut best = vec![0.0f32; count];
-        for left in 0..count {
-            for right in (left + 1)..count {
-                let score = pair_cosine(slots[left].1, &slots[left].2, slots[right].1, &slots[right].2);
-                if score >= threshold {
-                    unite(&mut parent, &mut rank, &mut best, left, right, score);
-                }
-            }
-        }
-        let mut buckets: Vec<Vec<i64>> = vec![Vec::new(); count];
-        for (index, slot) in slots.iter().enumerate() {
-            buckets[find(&mut parent, index)].push(slot.0);
-        }
-        let mut groups = Vec::new();
-        for (root, mut ids) in buckets.into_iter().enumerate() {
-            if ids.len() < 2 {
-                continue;
-            }
-            ids.sort_unstable();
-            groups.push(Group { ids, score: best[root] });
-        }
-        groups.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.ids[0].cmp(&b.ids[0])));
-        groups
+        slots
     }
 
     fn score(&self, id: i64, query: &[f32]) -> Option<f32> {
@@ -322,6 +301,44 @@ pub fn quantize(vector: &[f32]) -> (f32, Vec<i8>) {
         })
         .collect();
     (scale, quantized)
+}
+
+/// `keep_going` is called once per photo. Return `None` when it says to stop
+/// so a search can run before the rest of the pairs are compared.
+pub(crate) fn group_slots(
+    slots: &[(i64, f32, Vec<i8>)],
+    threshold: f32,
+    mut keep_going: impl FnMut(usize) -> bool,
+) -> Option<Vec<Group>> {
+    let count = slots.len();
+    let mut parent: Vec<usize> = (0..count).collect();
+    let mut rank = vec![0u8; count];
+    let mut best = vec![0.0f32; count];
+    for left in 0..count {
+        if !keep_going(left) {
+            return None;
+        }
+        for right in (left + 1)..count {
+            let score = pair_cosine(slots[left].1, &slots[left].2, slots[right].1, &slots[right].2);
+            if score >= threshold {
+                unite(&mut parent, &mut rank, &mut best, left, right, score);
+            }
+        }
+    }
+    let mut buckets: Vec<Vec<i64>> = vec![Vec::new(); count];
+    for (index, slot) in slots.iter().enumerate() {
+        buckets[find(&mut parent, index)].push(slot.0);
+    }
+    let mut groups = Vec::new();
+    for (root, mut ids) in buckets.into_iter().enumerate() {
+        if ids.len() < 2 {
+            continue;
+        }
+        ids.sort_unstable();
+        groups.push(Group { ids, score: best[root] });
+    }
+    groups.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.ids[0].cmp(&b.ids[0])));
+    Some(groups)
 }
 
 fn pair_cosine(scale_a: f32, a: &[i8], scale_b: f32, b: &[i8]) -> f32 {
