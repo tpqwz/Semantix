@@ -8,13 +8,13 @@ Nothing leaves the computer after the models are present. There is no account an
 
 ## Download
 
-[v0.1.0-alpha.2](https://github.com/tpqwz/semantix/releases/tag/v0.1.0-alpha.2) is one executable per platform. The file is the program.
+[v0.1.0-alpha.2](https://github.com/tpqwz/Semantix/releases/tag/v0.1.0-alpha.2) is one executable per platform. The file is the program.
 
 | Platform | File |
 | --- | --- |
-| Linux x64 | [semantix-linux-x64](https://github.com/tpqwz/semantix/releases/download/v0.1.0-alpha.2/semantix-linux-x64) |
-| macOS arm64 | [semantix-osx-arm64](https://github.com/tpqwz/semantix/releases/download/v0.1.0-alpha.2/semantix-osx-arm64) |
-| Windows x64 | [semantix-win-x64.exe](https://github.com/tpqwz/semantix/releases/download/v0.1.0-alpha.2/semantix-win-x64.exe) |
+| Linux x64 | [semantix-linux-x64](https://github.com/tpqwz/Semantix/releases/download/v0.1.0-alpha.2/semantix-linux-x64) |
+| macOS arm64 | [semantix-osx-arm64](https://github.com/tpqwz/Semantix/releases/download/v0.1.0-alpha.2/semantix-osx-arm64) |
+| Windows x64 | [semantix-win-x64.exe](https://github.com/tpqwz/Semantix/releases/download/v0.1.0-alpha.2/semantix-win-x64.exe) |
 
 On Linux and macOS, `chmod +x` the download before the first launch. The first OCR or CLIP run downloads ONNX Runtime. Download models, or `semantix fetch-models`, downloads the model files. Both are checked against a published SHA-256.
 
@@ -23,7 +23,7 @@ The window is [egui](https://github.com/emilk/egui). Indexing, ONNX Runtime, SQL
 ## Build
 
 ```sh
-cd semantix
+cd Semantix
 cargo build --release
 ```
 
