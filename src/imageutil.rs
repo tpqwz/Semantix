@@ -62,6 +62,72 @@ fn flatten(image: DynamicImage) -> RgbImage {
     out
 }
 
+/// Stored thumbnail when the indexer has written one. Otherwise a small
+/// decode of the original, so a scanned-but-not-indexed photo still previews.
+pub fn cell_preview(thumb: Option<&Path>, original: &Path, max_side: u32) -> Option<RgbImage> {
+    if let Some(rgb) = thumb.and_then(read_rgb) {
+        return Some(fit(&rgb, max_side));
+    }
+    if !is_image(original) {
+        return None;
+    }
+    let len = std::fs::metadata(original).ok()?.len();
+    if len == 0 || len > 32 * 1024 * 1024 {
+        return None;
+    }
+    match read_photo(original, 8) {
+        PhotoRead::Bytes(bytes) => decode(&bytes).ok().map(|decoded| fit(&decoded.rgb, max_side)),
+        PhotoRead::Unread | PhotoRead::RemoteFailed => None,
+    }
+}
+
+pub(crate) enum PhotoRead {
+    Bytes(Vec<u8>),
+    /// The filesystem did not answer in time.
+    Unread,
+    /// The pCloud catalog has this file and the download did not return it.
+    RemoteFailed,
+}
+
+/// Bytes for a photo. A pCloud file is downloaded over HTTPS. Anything else
+/// is read from disk, and a stuck read is abandoned after `secs`.
+pub(crate) fn read_photo(path: &Path, secs: u64) -> PhotoRead {
+    match crate::pcloud::fetch(path) {
+        crate::pcloud::Fetch::Bytes(bytes) => return PhotoRead::Bytes(bytes),
+        crate::pcloud::Fetch::Failed => return PhotoRead::RemoteFailed,
+        crate::pcloud::Fetch::NotCloud => {}
+    }
+    match read_within(path, secs) {
+        Some(bytes) => PhotoRead::Bytes(bytes),
+        None => PhotoRead::Unread,
+    }
+}
+
+/// A local read that must not sit forever. pCloud files do not come through here.
+pub(crate) fn read_within(path: &Path, secs: u64) -> Option<Vec<u8>> {
+    let output = std::process::Command::new("timeout")
+        .args(["--signal=KILL", &secs.to_string(), "cat", "--"])
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    Some(output.stdout)
+}
+
+fn read_rgb(path: &Path) -> Option<RgbImage> {
+    let bytes = std::fs::read(path).ok()?;
+    decode(&bytes).ok().map(|decoded| decoded.rgb)
+}
+
+/// A thumbnail already written under the data directory. Does not touch the original.
+pub fn stored_thumb(path: &Path, max_side: u32) -> Option<RgbImage> {
+    read_rgb(path).map(|rgb| fit(&rgb, max_side))
+}
+
 pub fn fit(image: &RgbImage, max_side: u32) -> RgbImage {
     let (width, height) = image.dimensions();
     let long = width.max(height);
@@ -94,4 +160,35 @@ pub fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 #[allow(dead_code)]
 pub fn solid(width: u32, height: u32, color: [u8; 3]) -> RgbImage {
     RgbImage::from_pixel(width, height, Rgb(color))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cell_preview_uses_the_original_when_the_thumb_is_missing() {
+        let dir = std::env::temp_dir().join(format!("semantix-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("shot.png");
+        solid(4, 4, [10, 20, 30]).save(&original).unwrap();
+        let preview = cell_preview(Some(&dir.join("missing.jpg")), &original, 64).expect("preview");
+        assert_eq!(preview.dimensions(), (4, 4));
+        assert_eq!(preview.get_pixel(0, 0).0, [10, 20, 30]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stuck_file_does_not_hold_the_preview() {
+        let dir = std::env::temp_dir().join(format!("semantix-stuck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("stuck.png");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let started = std::time::Instant::now();
+        assert!(read_within(&fifo, 1).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

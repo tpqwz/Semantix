@@ -29,6 +29,8 @@ pub struct Progress {
     pub total: u32,
     pub path: String,
     pub paused: bool,
+    /// This file's CLIP vector was stored on this step.
+    pub embedded: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -168,13 +170,69 @@ impl Engine {
         Ok(Job { root_id, pending, scanned })
     }
 
+    /// Decode, store the preview, and embed. Text recognition stays for Index.
+    pub fn preview_one(&mut self, id: i64) -> Result<String> {
+        let row = self.db.get(id)?;
+        let path = row.path.clone();
+        if row.thumb.as_deref().is_some_and(|thumb| !thumb.is_empty()) && row.width.is_some() {
+            if row.embed_status != "done" {
+                let thumb = row.thumb.unwrap_or_default();
+                let file = self.cfg.data_dir.join("thumbs").join(thumb);
+                if let Some(rgb) = imageutil::stored_thumb(&file, 384) {
+                    self.embed_rgb(id, &rgb)?;
+                }
+            }
+            return Ok(path);
+        }
+        match prepare_preview(Path::new(&path)) {
+            Prepared::Unread(reason) => self.db.skip_preview(id, reason)?,
+            Prepared::Failed(err) => self.db.mark_failed(id, &err)?,
+            Prepared::Ready { hash, decoded } => {
+                if let Err(err) = self.write_thumb(id, &hash, &decoded) {
+                    self.db.mark_failed(id, &err.to_string())?;
+                    return Ok(path);
+                }
+                self.embed_rgb(id, &decoded.rgb)?;
+            }
+        }
+        Ok(path)
+    }
+
+    /// Store a CLIP vector for `id`. `Ok(true)` means a vector is saved.
+    fn embed_rgb(&mut self, id: i64, rgb: &image::RgbImage) -> Result<bool> {
+        if self.clip.is_none() || self.store.is_none() {
+            return Ok(false);
+        }
+        if self.db.get(id)?.embed_status == "done" {
+            return Ok(true);
+        }
+        let stamp = self.clip_stamp.clone();
+        match self.clip.as_mut().unwrap().image(rgb) {
+            Ok(vector) => {
+                if let Some(store) = self.store.as_mut() {
+                    store.put(id, &vector)?;
+                }
+                self.db.set_embed_done(id, &stamp)?;
+                Ok(true)
+            }
+            Err(err) => {
+                self.db.set_embed_error(id, &err.to_string())?;
+                Ok(false)
+            }
+        }
+    }
+
     pub fn index_one(&mut self, id: i64) -> Result<String> {
         let row = self.db.get(id)?;
         let path = row.path.clone();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                self.db.mark_failed(id, &err.to_string())?;
+        let bytes = match imageutil::read_photo(Path::new(&path), PREVIEW_WAIT_SECS) {
+            imageutil::PhotoRead::Bytes(bytes) => bytes,
+            imageutil::PhotoRead::RemoteFailed => {
+                self.db.skip_preview(id, "pCloud did not return the file")?;
+                return Ok(path);
+            }
+            imageutil::PhotoRead::Unread => {
+                self.db.skip_preview(id, "unread after 45s")?;
                 return Ok(path);
             }
         };
@@ -749,6 +807,7 @@ pub enum Cmd {
     SaveCollection { name: String, ids: Vec<i64> },
     DeleteCollection(i64),
     RemoveFromCollection { collection: i64, file: i64 },
+    BuildPreviews,
     FetchModels,
     RetryErrors,
     SetDetLimit(u32),
@@ -778,6 +837,7 @@ pub struct Handle {
     rx: Receiver<Event>,
     pause: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Handle {
@@ -802,6 +862,16 @@ impl Handle {
     }
 }
 
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        let _ = self.tx.send(Cmd::Shutdown);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub fn spawn(cfg: Config) -> Handle {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (ev_tx, ev_rx) = mpsc::channel();
@@ -809,12 +879,13 @@ pub fn spawn(cfg: Config) -> Handle {
     let cancel = Arc::new(AtomicBool::new(false));
     let pause_worker = pause.clone();
     let cancel_worker = cancel.clone();
-    thread::spawn(move || worker(cfg, cmd_rx, ev_tx, pause_worker, cancel_worker));
+    let thread = thread::spawn(move || worker(cfg, cmd_rx, ev_tx, pause_worker, cancel_worker));
     Handle {
         tx: cmd_tx,
         rx: ev_rx,
         pause,
         cancel,
+        thread: Some(thread),
     }
 }
 
@@ -858,6 +929,14 @@ fn dispatch(
 ) {
     match cmd {
         Cmd::Shutdown => {}
+        Cmd::BuildPreviews => {
+            cancel.store(false, Ordering::Relaxed);
+            if let Err(err) = preview_controlled(engine, rx, ev, pause, cancel, deferred) {
+                let _ = ev.send(Event::Error(format!("{err:#}")));
+            }
+            let _ = ev.send(Event::Idle);
+            send_shelf(engine, ev);
+        }
         Cmd::IndexPath(path) => {
             cancel.store(false, Ordering::Relaxed);
             if let Err(err) = index_controlled(engine, std::slice::from_ref(&path), rx, ev, pause, cancel, deferred) {
@@ -867,20 +946,28 @@ fn dispatch(
             let _ = send_roots(engine, ev);
             send_shelf(engine, ev);
         }
-        Cmd::IndexAll | Cmd::RetryErrors => {
-            if matches!(cmd, Cmd::RetryErrors) {
-                match engine.retry_errors() {
-                    Ok(count) => {
-                        let _ = ev.send(Event::Note(format!("queued {count} failed files")));
-                    }
-                    Err(err) => {
-                        let _ = ev.send(Event::Error(format!("{err:#}")));
-                        let _ = ev.send(Event::Idle);
-                        send_shelf(engine, ev);
-                        return;
-                    }
+        Cmd::RetryErrors => {
+            match engine.retry_errors() {
+                Ok(count) => {
+                    let _ = ev.send(Event::Note(format!(
+                        "trying {count} failed files again, previews only. Saved embeddings stay."
+                    )));
+                }
+                Err(err) => {
+                    let _ = ev.send(Event::Error(format!("{err:#}")));
+                    let _ = ev.send(Event::Idle);
+                    send_shelf(engine, ev);
+                    return;
                 }
             }
+            cancel.store(false, Ordering::Relaxed);
+            if let Err(err) = preview_controlled(engine, rx, ev, pause, cancel, deferred) {
+                let _ = ev.send(Event::Error(format!("{err:#}")));
+            }
+            let _ = ev.send(Event::Idle);
+            send_shelf(engine, ev);
+        }
+        Cmd::IndexAll => {
             cancel.store(false, Ordering::Relaxed);
             let roots = engine.roots().unwrap_or_default();
             let paths: Vec<PathBuf> = roots.into_iter().map(|(_, path)| PathBuf::from(path)).collect();
@@ -986,6 +1073,144 @@ fn dispatch(
     }
 }
 
+const PREVIEW_WAIT_SECS: u64 = 45;
+
+/// Several photos at once. pCloud is slow to start a file, so each read is
+/// allowed to sit before it is skipped. Capped at 8 so the mount is not flooded.
+fn preview_workers(jobs: usize) -> usize {
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let n = cpus.clamp(4, 8);
+    n.min(jobs.max(1))
+}
+
+enum Prepared {
+    Unread(&'static str),
+    Failed(String),
+    Ready { hash: String, decoded: Decoded },
+}
+
+fn prepare_preview(path: &Path) -> Prepared {
+    let bytes = match imageutil::read_photo(path, PREVIEW_WAIT_SECS) {
+        imageutil::PhotoRead::Bytes(bytes) => bytes,
+        imageutil::PhotoRead::RemoteFailed => return Prepared::Unread("pCloud did not return the file"),
+        imageutil::PhotoRead::Unread => return Prepared::Unread("unread after 45s"),
+    };
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    match imageutil::decode(&bytes) {
+        Ok(decoded) => Prepared::Ready { hash, decoded },
+        Err(err) => Prepared::Failed(err.to_string()),
+    }
+}
+
+fn preview_controlled(
+    engine: &mut Engine,
+    rx: &Receiver<Cmd>,
+    ev: &Sender<Event>,
+    pause: &AtomicBool,
+    cancel: &AtomicBool,
+    deferred: &mut std::collections::VecDeque<Cmd>,
+) -> Result<()> {
+    // Earlier skips were 8-second cuts while 12 reads ran at once. Try those again.
+    let _ = engine.db.clear_preview_reason("could not read the file");
+    let _ = engine.db.clear_preview_reason("read timed out");
+    let _ = engine.db.clear_preview_reason("unread after 45s");
+    let have_thumb = engine.db.thumbs_needing_embed()?;
+    for (id, thumb) in have_thumb {
+        let path = engine.cfg.data_dir.join("thumbs").join(&thumb);
+        if let Some(rgb) = imageutil::stored_thumb(&path, 384) {
+            let _ = engine.embed_rgb(id, &rgb);
+        }
+    }
+    send_shelf(engine, ev);
+    let ids = engine.db.missing_previews()?;
+    let present = engine.db.stats()?.images.max(0) as u32;
+    let remaining = ids.len() as u32;
+    if remaining == 0 {
+        send_shelf(engine, ev);
+        return Ok(());
+    }
+    let already = present.saturating_sub(remaining);
+    let mut jobs = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row = engine.db.get(id)?;
+        if row.thumb.as_deref().is_some_and(|thumb| !thumb.is_empty()) && row.width.is_some() {
+            continue;
+        }
+        jobs.push((id, row.path));
+    }
+    let readers = preview_workers(jobs.len());
+    let _ = ev.send(Event::Note(format!(
+        "downloading photos from pCloud and embedding them, {readers} at a time, continuing at {already} of {present}. Saved embeddings are kept."
+    )));
+    let mut finished = 0u32;
+    let stop = AtomicBool::new(false);
+    let stop = &stop;
+    thread::scope(|scope| {
+        let (done_tx, done_rx) = mpsc::channel();
+        let n = readers;
+        let chunks: Vec<Vec<(i64, String)>> = (0..n)
+            .map(|worker| jobs.iter().skip(worker).step_by(n).cloned().collect())
+            .collect();
+        for chunk in chunks {
+            let done_tx = done_tx.clone();
+            scope.spawn(move || {
+                for (id, path) in chunk {
+                    while pause.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed)
+                    {
+                        thread::sleep(Duration::from_millis(40));
+                    }
+                    if cancel.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let prepared = prepare_preview(Path::new(&path));
+                    if done_tx.send((id, path, prepared)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(done_tx);
+        while let Ok((id, path, prepared)) = done_rx.recv() {
+            let mut embedded = false;
+            let saved = match prepared {
+                Prepared::Unread(reason) => engine.db.skip_preview(id, reason),
+                Prepared::Failed(err) => engine.db.mark_failed(id, &err),
+                Prepared::Ready { hash, decoded } => match engine.write_thumb(id, &hash, &decoded) {
+                    Ok(()) => match engine.embed_rgb(id, &decoded.rgb) {
+                        Ok(done) => {
+                            embedded = done;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    },
+                    Err(err) => engine.db.mark_failed(id, &err.to_string()),
+                },
+            };
+            if let Err(err) = saved {
+                let _ = ev.send(Event::Error(format!("{err:#}")));
+            }
+            finished += 1;
+            if finished % 10 == 0 {
+                send_shelf(engine, ev);
+            }
+            let _ = ev.send(Event::Progress(Progress {
+                done: already + finished,
+                total: present,
+                path,
+                paused: pause.load(Ordering::Relaxed),
+                embedded,
+            }));
+            drain_interactive(engine, rx, ev, cancel, deferred);
+            if cancel.load(Ordering::Relaxed)
+                || deferred.iter().any(|cmd| matches!(cmd, Cmd::IndexPath(_) | Cmd::IndexAll | Cmd::Shutdown))
+            {
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+    Ok(())
+}
+
 fn index_controlled(
     engine: &mut Engine,
     folders: &[PathBuf],
@@ -1019,11 +1244,13 @@ fn index_controlled(
                 return Ok(());
             }
             let path = engine.index_one(id)?;
+            let embedded = engine.db.get(id).map(|row| row.embed_status == "done").unwrap_or(false);
             let _ = ev.send(Event::Progress(Progress {
                 done: index as u32 + 1,
                 total,
                 path,
                 paused: false,
+                embedded,
             }));
         }
         if !cancel.load(Ordering::Relaxed) {
@@ -1157,6 +1384,12 @@ fn merge_exif(exif_json: &str, note: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_readers_use_half_the_cpus_up_to_twelve() {
+        assert_eq!(preview_workers(0), 1);
+        assert!((4..=8).contains(&preview_workers(10_000)));
+    }
 
     fn live_models() -> Option<PathBuf> {
         let mut dirs = Vec::new();

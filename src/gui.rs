@@ -8,8 +8,10 @@ use crate::imageutil;
 use crate::search::{self, Hit, Mode};
 use anyhow::{anyhow, Result};
 use eframe::egui;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const SEARCH_ID: &str = "semantix-search";
@@ -52,15 +54,21 @@ struct Card {
 struct TexCache {
     map: HashMap<i64, egui::TextureHandle>,
     order: VecDeque<i64>,
+    miss: HashSet<i64>,
 }
 
 pub fn run(cfg: Config) -> Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1240.0, 820.0])
-            .with_title("Semantix"),
-        ..Default::default()
-    };
+    launch(cfg)
+}
+
+pub(crate) fn launch(cfg: Config) -> Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([822.0, 819.0])
+        .with_title("Semantix");
+    if let Some([x, y, w, h]) = crate::hot::saved_bounds() {
+        viewport = viewport.with_position([x as f32, y as f32]).with_inner_size([w as f32, h as f32]);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "Semantix",
         options,
@@ -104,13 +112,20 @@ struct GalleryApp {
     roots: Vec<(i64, String)>,
     error: Option<String>,
     det_limit: u32,
+    search_floor: f32,
+    held_hits: Vec<crate::search::Hit>,
     cols: usize,
+    /// Card the keyboard just moved to. The grid scrolls until it is visible, then clears this.
+    follow: Option<i64>,
+    previews: PreviewPump,
     last_refresh: Instant,
     searches: Vec<db::SavedSearch>,
     collections: Vec<db::Collection>,
     shelf_name: String,
     open_collection: Option<i64>,
     view_note: Option<String>,
+    log: Vec<String>,
+    log_open: bool,
     dup_threshold: f32,
     show_frames: bool,
     folder_filter: Option<i64>,
@@ -136,7 +151,8 @@ impl GalleryApp {
             folder: String::new(),
             cards: Vec::new(),
             gallery: Vec::new(),
-            textures: TexCache { map: HashMap::new(), order: VecDeque::new() },
+            textures: TexCache { map: HashMap::new(), order: VecDeque::new(), miss: HashSet::new() },
+            previews: PreviewPump::new(),
             selected: None,
             detail: None,
             viewer: false,
@@ -153,13 +169,18 @@ impl GalleryApp {
             roots: Vec::new(),
             error: None,
             det_limit: 960,
+            search_floor: 0.185,
+            held_hits: Vec::new(),
             cols: 1,
+            follow: None,
             last_refresh: Instant::now(),
             searches: Vec::new(),
             collections: Vec::new(),
             shelf_name: String::new(),
             open_collection: None,
             view_note: None,
+            log: Vec::new(),
+            log_open: false,
             dup_threshold: 0.95,
             show_frames: false,
             folder_filter: None,
@@ -170,7 +191,13 @@ impl GalleryApp {
         while let Some(event) = self.handle.try_recv() {
             match event {
                 Event::Ready(info) => {
+                    for note in &info.notes {
+                        self.push_log(note.clone());
+                    }
                     self.notes = info.notes;
+                    if crate::hot::generation() > 0 {
+                        self.notes.insert(0, "Reloaded. The open library was kept.".to_string());
+                    }
                     self.ocr_ready = info.ocr;
                     self.clip_ready = info.clip;
                     self.runtime = info.runtime;
@@ -182,8 +209,16 @@ impl GalleryApp {
                     if !self.showing_hits {
                         self.rebuild_cards();
                     }
+                    self.handle.send(Cmd::BuildPreviews);
                 }
                 Event::Progress(progress) => {
+                    let name = Path::new(&progress.path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| progress.path.clone());
+                    let state = if progress.paused { " paused" } else { "" };
+                    let wrote = if progress.embedded { " embedded" } else { "" };
+                    self.push_log(format!("{}/{} {name}{wrote}{state}", progress.done, progress.total));
                     self.running = true;
                     self.progress = Some(progress);
                     if self.last_refresh.elapsed() > Duration::from_millis(400) {
@@ -195,18 +230,25 @@ impl GalleryApp {
                     }
                 }
                 Event::Hits { gen, hits } => {
+                    self.push_log(format!("{} matches", hits.len()));
                     if gen == self.gen && matches!(self.tab, Tab::Semantic | Tab::Hybrid | Tab::Duplicates) {
-                        self.cards = hits.into_iter().map(card_from_hit).collect();
+                        self.held_hits = hits;
+                        self.apply_search_floor();
                         self.showing_hits = true;
                     }
                 }
                 Event::Note(note) => {
+                    self.push_log(note.clone());
                     if !self.notes.iter().any(|existing| existing == &note) {
                         self.notes.push(note);
                     }
                 }
-                Event::Error(message) => self.error = Some(message),
+                Event::Error(message) => {
+                    self.push_log(message.clone());
+                    self.error = Some(message);
+                }
                 Event::Idle => {
+                    self.push_log("idle");
                     self.running = false;
                     self.reload();
                     if !self.showing_hits {
@@ -443,6 +485,7 @@ impl GalleryApp {
         let id = frames[next].id;
         if id != detail.id {
             self.open_frame(id);
+            self.follow = Some(id);
         }
         true
     }
@@ -458,6 +501,7 @@ impl GalleryApp {
         let next = (current as isize + delta).clamp(0, self.cards.len() as isize - 1) as usize;
         let id = self.cards[next].id;
         self.load_detail(id);
+        self.follow = Some(id);
         if self.viewer {
             self.viewer_for = None;
         }
@@ -484,24 +528,73 @@ impl GalleryApp {
         }
     }
 
-    fn texture(&mut self, ctx: &egui::Context, id: i64, rel: &Option<String>) -> Option<egui::TextureId> {
-        if let Some(texture) = self.textures.map.get(&id) {
-            return Some(texture.id());
+    fn take_previews(&mut self, ctx: &egui::Context) {
+        while let Ok(done) = self.previews.rx.try_recv() {
+            self.previews.pending.remove(&done.id);
+            let Some(image) = done.image else {
+                self.textures.miss.insert(done.id);
+                continue;
+            };
+            self.store_texture(ctx, done.id, &image);
+            ctx.request_repaint();
         }
-        let rel = rel.as_ref()?;
-        let bytes = std::fs::read(self.data_dir.join("thumbs").join(rel)).ok()?;
-        let image = image::load_from_memory(&bytes).ok()?.into_rgb8();
+    }
+
+    fn store_texture(&mut self, ctx: &egui::Context, id: i64, image: &image::RgbImage) {
         let color = egui::ColorImage::from_rgb([image.width() as usize, image.height() as usize], image.as_raw());
         let handle = ctx.load_texture(format!("thumb-{id}"), color, egui::TextureOptions::LINEAR);
-        let texture_id = handle.id();
         self.textures.order.push_back(id);
         self.textures.map.insert(id, handle);
         while self.textures.order.len() > 180 {
             if let Some(old) = self.textures.order.pop_front() {
                 self.textures.map.remove(&old);
+                self.textures.miss.remove(&old);
             }
         }
-        Some(texture_id)
+    }
+
+    fn texture(&mut self, ctx: &egui::Context, id: i64, rel: &Option<String>, path: &str) -> Option<egui::TextureId> {
+        if let Some(texture) = self.textures.map.get(&id) {
+            return Some(texture.id());
+        }
+        if let Some(rel) = rel {
+            if let Some(image) = imageutil::stored_thumb(&self.data_dir.join("thumbs").join(rel), 384) {
+                self.store_texture(ctx, id, &image);
+                return self.textures.map.get(&id).map(|texture| texture.id());
+            }
+        }
+        let cached = live_thumb(&self.data_dir, id);
+        if let Some(image) = imageutil::stored_thumb(&cached, 384) {
+            self.store_texture(ctx, id, &image);
+            return self.textures.map.get(&id).map(|texture| texture.id());
+        }
+        if self.textures.miss.contains(&id) || self.previews.pending.contains_key(&id) {
+            return None;
+        }
+        let now = Instant::now();
+        let ages: Vec<u128> = self.previews.pending.values().map(|start| now.duration_since(*start).as_millis()).collect();
+        let fresh = fresh_preview_count(&ages, 400);
+        if admit_preview(fresh, self.previews.pending.len(), false) {
+            let thumb = rel.as_ref().map(|rel| self.data_dir.join("thumbs").join(rel));
+            let path = PathBuf::from(path);
+            let cache = cached;
+            let tx = self.previews.tx.clone();
+            self.previews.pending.insert(id, now);
+            thread::spawn(move || {
+                let image = imageutil::cell_preview(thumb.as_deref(), &path, 384);
+                if let Some(image) = image.as_ref() {
+                    if let Ok(bytes) = imageutil::encode_jpeg(image, 82) {
+                        if let Some(parent) = cache.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&cache, bytes);
+                    }
+                }
+                let _ = tx.send(PreviewDone { id, image });
+            });
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+        None
     }
 
     fn ensure_viewer(&mut self, ctx: &egui::Context) {
@@ -527,6 +620,30 @@ impl GalleryApp {
 
 impl eframe::App for GalleryApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        apply_style(ctx);
+        self.take_previews(ctx);
+        if !self.previews.pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if crate::hot::active() {
+            if let Some(rect) = ctx.input(|input| input.viewport().outer_rect) {
+                crate::hot::remember_bounds(rect.min.x as i32, rect.min.y as i32, rect.width() as i32, rect.height() as i32);
+            }
+            if let Some(message) = crate::hot::build_error() {
+                self.error = Some(message);
+            }
+            let title = if crate::hot::compiling() {
+                "Semantix — compiling"
+            } else {
+                "Semantix"
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
+            if crate::hot::reload_requested() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
         self.pump();
         self.dropped(ctx);
         let semantic = matches!(self.tab, Tab::Semantic | Tab::Hybrid);
@@ -550,11 +667,10 @@ impl eframe::App for GalleryApp {
         if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             ui.memory_mut(|memory| memory.request_focus(egui::Id::unique(SEARCH_ID)));
         }
-        let frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(12));
+        let frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::same(16));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            self.banner(ui);
             self.toolbar(ui);
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 for tab in Tab::all() {
                     if ui.selectable_label(self.tab == tab, tab.label()).clicked() {
@@ -634,14 +750,22 @@ impl eframe::App for GalleryApp {
                     self.fire_duplicates();
                 }
             }
-            ui.add_space(4.0);
+            ui.add_space(8.0);
+            let footer = if self.log_open { 188.0 } else { 32.0 };
+            let body_h = (ui.available_height() - footer - 8.0).max(160.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), body_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
             ui.horizontal_top(|ui| {
-                let side = 320.0;
-                let grid_width = (ui.available_width() - side - 8.0).max(200.0);
+                let side = (ui.available_width() * 0.28).clamp(240.0, 360.0);
+                let grid_width = (ui.available_width() - side - 28.0).max(180.0);
                 ui.allocate_ui_with_layout(
                     egui::vec2(grid_width, ui.available_height()),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
+                        // Keep the column when a filter or search leaves few photos.
+                        ui.set_min_size(egui::vec2(grid_width, ui.available_height()));
                         if self.viewer {
                             self.viewer_ui(ui);
                         } else {
@@ -653,37 +777,70 @@ impl eframe::App for GalleryApp {
                 ui.allocate_ui_with_layout(
                     egui::vec2(side, ui.available_height()),
                     egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.side(ui),
+                    |ui| {
+                        ui.set_min_size(egui::vec2(side, ui.available_height()));
+                        self.side(ui);
+                    },
                 );
             });
+                },
+            );
+            ui.add_space(6.0);
+            self.footer(ui);
             self.keys(ui, focused);
         });
     }
 }
 
 impl GalleryApp {
-    fn banner(&mut self, ui: &mut egui::Ui) {
-        let missing = !self.ocr_ready || !self.clip_ready;
-        if self.notes.is_empty() && self.error.is_none() && !missing {
-            return;
+    fn apply_search_floor(&mut self) {
+        let floor = self.search_floor;
+        let duplicates = self.tab == Tab::Duplicates;
+        let hits = self.held_hits.iter().filter(|hit| duplicates || keep_match(hit.score, hit.semantic, floor)).cloned();
+        self.cards = hits.map(card_from_hit).collect();
+    }
+
+    fn push_log(&mut self, line: impl Into<String>) {
+        push_log_line(&mut self.log, line.into());
+    }
+
+    fn footer(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.log_open, "Log").clicked() {
+                self.log_open = !self.log_open;
+            }
+            if let Some(error) = &self.error {
+                ui.colored_label(egui::Color32::from_rgb(255, 160, 120), error);
+            }
+            for note in self.notes.iter().take(2) {
+                ui.label(egui::RichText::new(note).small().weak());
+            }
+            if (!self.ocr_ready || !self.clip_ready) && ui.button("Download models").clicked() {
+                self.running = true;
+                self.handle.send(Cmd::FetchModels);
+            }
+        });
+        if self.log_open {
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_salt("log")
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .max_height(148.0)
+                .show(ui, |ui| {
+                    let body = if self.log.is_empty() {
+                        "Nothing yet.".to_string()
+                    } else {
+                        self.log.join("\n")
+                    };
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(body).monospace().small())
+                            .selectable(true)
+                            .wrap(),
+                    );
+                });
         }
-        egui::Frame::NONE
-            .fill(egui::Color32::from_rgb(48, 36, 20))
-            .inner_margin(egui::Margin::same(8))
-            .corner_radius(6.0)
-            .show(ui, |ui| {
-                if let Some(error) = &self.error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 160, 120), error);
-                }
-                for note in self.notes.iter().take(4) {
-                    ui.label(note);
-                }
-                if missing && ui.button("Download models").clicked() {
-                    self.running = true;
-                    self.handle.send(Cmd::FetchModels);
-                }
-            });
-        ui.add_space(6.0);
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -707,7 +864,7 @@ impl GalleryApp {
             if ui.add_enabled(self.running, egui::Button::new("Cancel")).clicked() {
                 self.handle.cancel();
             }
-            if ui.button("Retry errors").clicked() {
+            if ui.button("Retry failed reads").clicked() {
                 self.running = true;
                 self.handle.send(Cmd::RetryErrors);
             }
@@ -762,16 +919,30 @@ impl GalleryApp {
             return;
         }
         let width = ui.available_width();
-        let cols = if self.grid { (width / 168.0).floor().max(1.0) as usize } else { 1 };
+        let cols = if self.grid { grid_columns(width) } else { 1 };
         self.cols = cols;
         let rows = self.cards.len().div_ceil(cols);
         let annotated = self.cards.iter().any(|card| !card.snippet.is_empty());
         let row_h = if self.grid {
             if annotated { 208.0 } else { 188.0 }
         } else {
-            28.0
+            44.0
         };
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows, |ui, range| {
+        let scroll_id = ui.make_persistent_id(egui::IdSalt::new("semantix-browser"));
+        let mut area = egui::ScrollArea::vertical().id_salt("semantix-browser").auto_shrink([false, false]);
+        if let Some(id) = self.follow {
+            if let Some(index) = self.cards.iter().position(|card| card.id == id) {
+                let row = index / cols.max(1);
+                let spacing = ui.spacing().item_spacing.y;
+                let viewport = ui.available_height();
+                let current = egui::scroll_area::State::load(ui.ctx(), scroll_id).map(|state| state.clamped_offset().y).unwrap_or(0.0);
+                if let Some(offset) = follow_offset(row, row_h, spacing, viewport, current) {
+                    area = area.vertical_scroll_offset(offset);
+                }
+            }
+            self.follow = None;
+        }
+        area.show_rows(ui, row_h, rows, |ui, range| {
             for row in range {
                 if self.grid {
                     ui.horizontal(|ui| {
@@ -798,7 +969,7 @@ impl GalleryApp {
             egui::Layout::top_down(egui::Align::Center),
             |ui| {
                 let (rect, response) = ui.allocate_exact_size(egui::vec2(148.0, 148.0), egui::Sense::click());
-                if let Some(texture) = self.texture(ui.ctx(), card.id, &card.thumb) {
+                if let Some(texture) = self.texture(ui.ctx(), card.id, &card.thumb, &card.path) {
                     ui.painter().image(
                         texture,
                         rect,
@@ -851,7 +1022,21 @@ impl GalleryApp {
         } else {
             format!("{title}  {}", card.snippet)
         };
-        let response = ui.selectable_label(selected, label);
+        let response = ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::hover());
+            if let Some(texture) = self.texture(ui.ctx(), card.id, &card.thumb, &card.path) {
+                ui.painter().image(
+                    texture,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                ui.painter().rect_filled(rect, egui::CornerRadius::same(3), egui::Color32::from_gray(32));
+            }
+            ui.selectable_label(selected, label)
+        });
+        let response = response.inner;
         if response.double_clicked() {
             self.load_detail(card.id);
             self.viewer = true;
@@ -899,16 +1084,19 @@ impl GalleryApp {
     }
 
     fn side(&mut self, ui: &mut egui::Ui) {
+        let width = (ui.available_width() - 16.0).max(160.0);
+        ui.set_max_width(width);
         egui::ScrollArea::vertical().id_salt("side").auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(width);
             if let Some(detail) = self.detail.clone() {
                 ui.strong(card_name(&detail.path, &detail.rel));
-                ui.label(&detail.path);
+                fitted(ui, &detail.path);
                 let source = frame_source(&detail.exif_json);
                 let clip = source.as_ref().and_then(|source| {
                     self.db.as_ref().and_then(|db| db.clip_frames(source).ok())
                 });
                 if let Some(source) = &source {
-                    ui.label(format!("Video: {source}"));
+                    fitted(ui, format!("Video: {source}"));
                     ui.horizontal(|ui| {
                         if ui.button("Show clip").clicked() {
                             self.show_clip(source);
@@ -929,7 +1117,7 @@ impl GalleryApp {
                     });
                 }
                 if let (Some(w), Some(h)) = (detail.width, detail.height) {
-                    ui.label(format!("{w}×{h} · OCR {} · embed {}", detail.ocr_status, detail.embed_status));
+                    fitted(ui, format!("{w}×{h} · OCR {} · embed {}", detail.ocr_status, detail.embed_status));
                 }
                 if let Some(error) = &detail.error {
                     ui.colored_label(egui::Color32::from_rgb(255, 160, 120), error);
@@ -945,7 +1133,7 @@ impl GalleryApp {
                 );
                 ui.strong("EXIF");
                 for line in exif_lines(&detail.exif_json) {
-                    ui.label(line);
+                    fitted(ui, line);
                 }
                 ui.horizontal(|ui| {
                     if ui.add_enabled(self.clip_ready, egui::Button::new("Find similar")).clicked() {
@@ -963,16 +1151,40 @@ impl GalleryApp {
                 ui.label("Select an image.");
             }
             ui.separator();
-            ui.label(format!("Models: {}", self.model_dir.display()));
-            ui.label(format!("Data: {}", self.data_dir.display()));
-            if !self.runtime.is_empty() {
-                ui.label(format!("Runtime: {}", self.runtime));
+            ui.strong("Settings");
+            ui.label("Embedding model");
+            ui.label(egui::RichText::new("CLIP ViT-B/32").strong());
+            ui.label(
+                egui::RichText::new(
+                    "Matches a phrase to a photo. SigLIP is stronger at that, and switching to it means building the embeddings again.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.label("Match strictness");
+            if ui
+                .add(egui::Slider::new(&mut self.search_floor, 0.050..=0.400).fixed_decimals(3))
+                .changed()
+            {
+                self.apply_search_floor();
             }
+            ui.label(
+                egui::RichText::new("Higher keeps only closer photo matches. Lower shows more distant ones.")
+                    .small()
+                    .weak(),
+            );
+            ui.label("Text detector detail");
+            ui.label("Long side");
             let mut limit = self.det_limit as i32;
-            if ui.add(egui::Slider::new(&mut limit, 640..=1600).text("det long side")).changed() {
+            if ui.add(egui::Slider::new(&mut limit, 640..=1600)).changed() {
                 self.det_limit = limit as u32;
                 self.handle.send(Cmd::SetDetLimit(self.det_limit));
             }
+            ui.label(
+                egui::RichText::new("How large a photo is when the text reader looks at it. Higher can read smaller type, and is slower. It does not change photo search.")
+                    .small()
+                    .weak(),
+            );
             ui.separator();
             ui.strong("Saved");
             ui.add(egui::TextEdit::singleline(&mut self.shelf_name).hint_text("Name").desired_width(f32::INFINITY));
@@ -1021,7 +1233,7 @@ impl GalleryApp {
                     if ui.button(&search.name).clicked() {
                         self.run_saved(&search.mode, &search.query);
                     }
-                    ui.weak(format!("{} · {}", search.mode, search.query));
+                    fitted(ui, format!("{} · {}", search.mode, search.query));
                     if ui.small_button("×").clicked() {
                         self.handle.send(Cmd::DeleteSearch(search.id));
                     }
@@ -1044,17 +1256,16 @@ impl GalleryApp {
             ui.strong("Folders");
             let roots = self.roots.clone();
             for (id, path) in roots {
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(self.folder_filter == Some(id), &path).clicked() {
-                        self.select_folder(id);
+                let select = ui.add(egui::Label::new(&path).wrap().sense(egui::Sense::click()));
+                if select.clicked() {
+                    self.select_folder(id);
+                }
+                if ui.small_button("Forget").clicked() {
+                    if self.folder_filter == Some(id) {
+                        self.folder_filter = None;
                     }
-                    if ui.small_button("Forget").clicked() {
-                        if self.folder_filter == Some(id) {
-                            self.folder_filter = None;
-                        }
-                        self.handle.send(Cmd::RemoveRoot(id));
-                    }
-                });
+                    self.handle.send(Cmd::RemoveRoot(id));
+                }
             }
         });
     }
@@ -1182,6 +1393,80 @@ fn card_note(card: &Card) -> String {
     }
 }
 
+/// Scroll offset that puts `row` inside the viewport. `None` when it is already visible.
+struct PreviewDone {
+    id: i64,
+    image: Option<image::RgbImage>,
+}
+
+struct PreviewPump {
+    tx: Sender<PreviewDone>,
+    rx: Receiver<PreviewDone>,
+    pending: HashMap<i64, Instant>,
+}
+
+impl PreviewPump {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self { tx, rx, pending: HashMap::new() }
+    }
+}
+
+/// A read that has not finished quickly does not keep the next photo waiting.
+const GRID_CELL: f32 = 168.0;
+
+/// Wider windows gain columns. The default window leaves room for three.
+fn grid_columns(width: f32) -> usize {
+    (width / GRID_CELL).floor().max(1.0) as usize
+}
+
+fn push_log_line(log: &mut Vec<String>, line: String) {
+    log.push(line);
+    if log.len() > 500 {
+        let extra = log.len() - 500;
+        log.drain(0..extra);
+    }
+}
+
+fn keep_match(score: f32, semantic: bool, floor: f32) -> bool {
+    !semantic || score >= floor
+}
+
+fn fitted(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.add(egui::Label::new(text.into()).wrap());
+}
+
+fn apply_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.spacing.interact_size.y = 30.0;
+    });
+}
+
+fn live_thumb(data_dir: &Path, id: i64) -> PathBuf {
+    data_dir.join("thumbs").join("live").join(format!("{id}.jpg"))
+}
+
+fn fresh_preview_count(ages_ms: &[u128], stall_ms: u128) -> usize {
+    ages_ms.iter().filter(|age| **age < stall_ms).count()
+}
+
+fn admit_preview(fresh: usize, total: usize, already: bool) -> bool {
+    !already && fresh < 3 && total < 12
+}
+
+fn follow_offset(row: usize, row_h: f32, spacing: f32, viewport: f32, current: f32) -> Option<f32> {
+    let stride = row_h + spacing;
+    let top = row as f32 * stride;
+    let bottom = top + row_h;
+    if top >= current - 0.5 && bottom <= current + viewport + 0.5 {
+        None
+    } else {
+        Some((top - (viewport - row_h) * 0.5).max(0.0))
+    }
+}
+
 fn group_number(snippet: &str) -> Option<usize> {
     let rest = snippet.strip_prefix("group ")?;
     let number = rest.split_whitespace().next()?;
@@ -1227,5 +1512,39 @@ mod tests {
             Some("/videos/clip.mp4")
         );
         assert!(frame_source("{}").is_none());
+    }
+
+    #[test]
+    fn preview_decode_stays_off_the_window_thread_and_stays_bounded() {
+        assert!(admit_preview(0, 0, false));
+        assert!(!admit_preview(3, 3, false));
+        assert!(!admit_preview(0, 12, false));
+        assert!(!admit_preview(0, 0, true));
+        assert_eq!(fresh_preview_count(&[500, 500], 400), 0);
+        assert_eq!(fresh_preview_count(&[100, 500], 400), 1);
+        let mut log = Vec::new();
+        for i in 0..510 {
+            push_log_line(&mut log, i.to_string());
+        }
+        assert_eq!(log.len(), 500);
+        assert_eq!(log[0], "10");
+        assert_eq!(grid_columns(656.0), 3);
+        assert_eq!(grid_columns(500.0), 2);
+        assert_eq!(grid_columns(840.0), 5);
+        assert!(keep_match(0.30, true, 0.22));
+        assert!(!keep_match(0.18, true, 0.22));
+        assert!(keep_match(0.10, false, 0.22));
+        assert_eq!(
+            live_thumb(Path::new("/data"), 42),
+            PathBuf::from("/data/thumbs/live/42.jpg")
+        );
+    }
+
+    #[test]
+    fn keyboard_scroll_centers_an_offscreen_row_and_leaves_a_visible_one() {
+        assert_eq!(follow_offset(0, 188.0, 4.0, 400.0, 0.0), None);
+        let jumped = follow_offset(20, 188.0, 4.0, 400.0, 0.0).unwrap();
+        assert!(jumped > 3000.0);
+        assert_eq!(follow_offset(1, 28.0, 4.0, 400.0, 0.0), None);
     }
 }

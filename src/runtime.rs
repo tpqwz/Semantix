@@ -51,6 +51,10 @@ pub fn environment(cuda: bool) -> Result<Environment> {
     if let Some(env) = guard.as_ref() {
         return Ok(env.clone());
     }
+    if let Some(env) = crate::hot::adopted_environment() {
+        *guard = Some(env.clone());
+        return Ok(env);
+    }
     let dir = match runtime_lib_dir() {
         Some(dir) => dir,
         None => download_runtime()?,
@@ -65,6 +69,7 @@ pub fn environment(cuda: bool) -> Result<Environment> {
         .with_telemetry(false)
         .build()
         .map_err(|err| anyhow!("onnx runtime: {err}"))?;
+    crate::hot::publish_environment(&env);
     *guard = Some(env.clone());
     Ok(env)
 }

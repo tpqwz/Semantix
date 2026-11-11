@@ -18,6 +18,9 @@ struct Cli {
     /// Run ONNX Runtime on CUDA device 0.
     #[arg(long, global = true)]
     cuda: bool,
+    /// Recompile on save and restart the window in this process.
+    #[arg(long, global = true)]
+    hot: bool,
     /// Inference device. `cuda` is the same as `--cuda`.
     #[arg(long, global = true, value_parser = ["cpu", "cuda"])]
     device: Option<String>,
@@ -92,6 +95,12 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let cuda = cli.cuda || cli.device.as_deref() == Some("cuda");
     let cfg = Config::resolve(cli.data, cli.models, cuda);
+    if cli.hot {
+        if !matches!(cli.command, None | Some(Command::Gui)) {
+            return Err(anyhow!("--hot reloads the window"));
+        }
+        return semantix::hot_host(cfg);
+    }
     match cli.command {
         None | Some(Command::Gui) => gui::run(cfg),
         Some(Command::Index { folder }) => {

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS files (
     width INTEGER,
     height INTEGER,
     exif_json TEXT,
+    taken_ns INTEGER,
     thumb TEXT,
     ocr_status TEXT NOT NULL DEFAULT 'pending',
     embed_status TEXT NOT NULL DEFAULT 'pending',
@@ -40,6 +41,10 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS files_present_mtime ON files(present, mtime_ns DESC, id DESC);
 CREATE INDEX IF NOT EXISTS files_hash ON files(hash);
+CREATE TABLE IF NOT EXISTS preview_skip (
+    file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ocr_doc (
     file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
     body TEXT NOT NULL
@@ -193,7 +198,11 @@ impl Library {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        conn.pragma_update(None, "user_version", 1)?;
+        ensure_taken_column(&conn)?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS files_capture ON files(present, COALESCE(taken_ns, mtime_ns) DESC, id DESC)",
+        )?;
+        conn.pragma_update(None, "user_version", 2)?;
         Ok(Self { conn })
     }
 
@@ -240,6 +249,7 @@ impl Library {
                    width=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns THEN files.width ELSE NULL END,
                    height=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns THEN files.height ELSE NULL END,
                    exif_json=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns THEN files.exif_json ELSE NULL END,
+                   taken_ns=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns THEN files.taken_ns ELSE NULL END,
                    thumb=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns THEN files.thumb ELSE NULL END,
                    ocr_status=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns THEN files.ocr_status ELSE 'pending' END,
                    embed_status=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns THEN files.embed_status ELSE 'pending' END,
@@ -257,6 +267,27 @@ impl Library {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn thumbs_needing_embed(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, thumb FROM files
+             WHERE present=1 AND embed_status='pending' AND thumb IS NOT NULL AND thumb != ''
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    pub fn missing_previews(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM files
+             WHERE present=1 AND (thumb IS NULL OR thumb='')
+               AND id NOT IN (SELECT file_id FROM preview_skip)
+             ORDER BY mtime_ns DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
     pub fn pending(&self, root_id: Option<i64>, ocr: bool, embed: bool) -> Result<Vec<i64>> {
@@ -349,11 +380,12 @@ impl Library {
         exif_json: &str,
         thumb: &str,
     ) -> Result<()> {
+        let taken = crate::exif::taken_ns(exif_json);
         self.conn.execute(
             "UPDATE files
-             SET hash=?2, width=?3, height=?4, exif_json=?5, thumb=?6, updated_at=?7
+             SET hash=?2, width=?3, height=?4, exif_json=?5, thumb=?6, taken_ns=?7, updated_at=?8
              WHERE id=?1",
-            params![id, hash, width, height, exif_json, thumb, now_secs()],
+            params![id, hash, width, height, exif_json, thumb, taken, now_secs()],
         )?;
         Ok(())
     }
@@ -407,6 +439,19 @@ impl Library {
         Ok(())
     }
 
+    pub fn clear_preview_reason(&mut self, reason: &str) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM preview_skip WHERE reason=?1", [reason])?)
+    }
+
+    pub fn skip_preview(&mut self, id: i64, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO preview_skip(file_id, reason) VALUES (?1, ?2)
+             ON CONFLICT(file_id) DO UPDATE SET reason=excluded.reason",
+            params![id, reason],
+        )?;
+        Ok(())
+    }
+
     pub fn retry_errors(&mut self) -> Result<usize> {
         let n = self.conn.execute(
             "UPDATE files SET
@@ -416,6 +461,7 @@ impl Library {
              WHERE ocr_status='error' OR embed_status='error'",
             [],
         )?;
+        self.conn.execute("DELETE FROM preview_skip", [])?;
         Ok(n)
     }
 
@@ -452,7 +498,6 @@ impl Library {
     }
 
     fn map_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
-        let exif: String = row.get(8)?;
         Ok(Item {
             id: row.get(0)?,
             path: row.get(1)?,
@@ -462,7 +507,7 @@ impl Library {
             width: row.get(5)?,
             height: row.get(6)?,
             mtime_ns: row.get(7)?,
-            taken_ns: crate::exif::taken_ns(&exif),
+            taken_ns: row.get(8)?,
         })
     }
 
@@ -470,18 +515,18 @@ impl Library {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // Sort after the read. Capture time lives in exif_json, and this build
-        // does not depend on JSON1. The limit is applied after that order, so
-        // a copied photo stays with the day it was taken.
+        // Photos that already have a preview stay at the front, in capture order.
+        // Files pCloud has not returned yet follow, so an empty result does not
+        // hide the pictures that are ready.
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, rel_path, root_id, thumb, width, height, mtime_ns, IFNULL(exif_json, '')
-             FROM files WHERE present=1",
+            "SELECT id, path, rel_path, root_id, thumb, width, height, mtime_ns, taken_ns
+             FROM files WHERE present=1
+             ORDER BY (thumb IS NOT NULL AND thumb != '') DESC,
+                      COALESCE(taken_ns, mtime_ns) DESC, id DESC
+             LIMIT ?1",
         )?;
-        let rows = stmt.query_map([], Self::map_item)?;
-        let mut items: Vec<Item> = rows.collect::<rusqlite::Result<_>>()?;
-        order_by_capture(&mut items);
-        items.truncate(limit);
-        Ok(items)
+        let rows = stmt.query_map([limit as i64], Self::map_item)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
     pub fn stats(&self) -> Result<Stats> {
@@ -643,16 +688,14 @@ impl Library {
 
     pub fn collection_items(&self, id: i64) -> Result<Vec<Item>> {
         let mut stmt = self.conn.prepare(
-            "SELECT f.id, f.path, f.rel_path, f.root_id, f.thumb, f.width, f.height, f.mtime_ns,
-                    IFNULL(f.exif_json, '')
+            "SELECT f.id, f.path, f.rel_path, f.root_id, f.thumb, f.width, f.height, f.mtime_ns, f.taken_ns
              FROM collection_items i
              JOIN files f ON f.id=i.file_id
-             WHERE i.collection_id=?1 AND f.present=1",
+             WHERE i.collection_id=?1 AND f.present=1
+             ORDER BY COALESCE(f.taken_ns, f.mtime_ns) DESC, f.id DESC",
         )?;
         let rows = stmt.query_map([id], Self::map_item)?;
-        let mut items: Vec<Item> = rows.collect::<rusqlite::Result<_>>()?;
-        order_by_capture(&mut items);
-        Ok(items)
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
     /// Frames sampled from one video, earliest time first.
@@ -761,12 +804,24 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn order_by_capture(items: &mut [Item]) {
-    items.sort_by(|a, b| {
-        let a_key = a.taken_ns.unwrap_or(a.mtime_ns);
-        let b_key = b.taken_ns.unwrap_or(b.mtime_ns);
-        b_key.cmp(&a_key).then(b.id.cmp(&a.id))
-    });
+fn ensure_taken_column(conn: &Connection) -> Result<()> {
+    let mut info = conn.prepare("PRAGMA table_info(files)")?;
+    let names: Vec<String> = info.query_map([], |row| row.get(1))?.collect::<rusqlite::Result<_>>()?;
+    drop(info);
+    if names.iter().any(|name| name == "taken_ns") {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE files ADD COLUMN taken_ns INTEGER")?;
+    let mut read = conn.prepare("SELECT id, IFNULL(exif_json, '') FROM files")?;
+    let rows: Vec<(i64, String)> = read
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(read);
+    for (id, json) in rows {
+        let taken = crate::exif::taken_ns(&json);
+        conn.execute("UPDATE files SET taken_ns=?2 WHERE id=?1", params![id, taken])?;
+    }
+    Ok(())
 }
 
 pub fn scratch_dir(name: &str) -> PathBuf {
@@ -1000,6 +1055,89 @@ mod tests {
         assert_eq!(collected, order);
         assert_eq!(db.gallery(2).unwrap().len(), 2);
         assert_eq!(db.gallery(0).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn old_library_keeps_capture_order_after_upgrade() {
+        let dir = scratch_dir("migrate");
+        let path = dir.join("library.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE roots (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+                 CREATE TABLE files (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    root_id INTEGER NOT NULL,
+                    rel_path TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    hash TEXT,
+                    width INTEGER,
+                    height INTEGER,
+                    exif_json TEXT,
+                    thumb TEXT,
+                    ocr_status TEXT NOT NULL DEFAULT 'pending',
+                    embed_status TEXT NOT NULL DEFAULT 'pending',
+                    ocr_model TEXT,
+                    embed_model TEXT,
+                    present INTEGER NOT NULL DEFAULT 1,
+                    error TEXT,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO roots(id, path) VALUES (1, '/photos');
+                 INSERT INTO files(path, root_id, rel_path, size, mtime_ns, exif_json, present, updated_at)
+                 VALUES
+                   ('/photos/old-copy.jpg', 1, 'old-copy.jpg', 3, 999, '{\"datetime\":\"2020:01:01 00:00:00\"}', 1, 1),
+                   ('/photos/shot.jpg', 1, 'shot.jpg', 3, 1, '{\"datetime\":\"2024:06:01 12:00:00\"}', 1, 1);",
+            )
+            .unwrap();
+        }
+        let db = Library::open(&path).unwrap();
+        let order: Vec<_> = db.gallery(10).unwrap().into_iter().map(|item| item.rel).collect();
+        assert_eq!(order, vec!["shot.jpg", "old-copy.jpg"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_skipped_preview_is_not_queued_again() {
+        let dir = scratch_dir("skip-preview");
+        let mut db = Library::open(&dir.join("library.db")).unwrap();
+        let root = db.add_root("/photos").unwrap();
+        db.rescan(
+            root,
+            &[ScanFile {
+                path: "/photos/a.jpg".into(),
+                rel: "a.jpg".into(),
+                size: 1,
+                mtime_ns: 1,
+            }],
+        )
+        .unwrap();
+        let id = db.missing_previews().unwrap()[0];
+        db.skip_preview(id, "could not read the file").unwrap();
+        assert!(db.missing_previews().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gallery_leads_with_photos_that_have_a_preview() {
+        let dir = scratch_dir("gallery-thumbs");
+        let mut db = Library::open(&dir.join("library.db")).unwrap();
+        let root = db.add_root("/photos").unwrap();
+        db.rescan(
+            root,
+            &[
+                ScanFile { path: "/photos/new.jpg".into(), rel: "new.jpg".into(), size: 1, mtime_ns: 50 },
+                ScanFile { path: "/photos/old.jpg".into(), rel: "old.jpg".into(), size: 1, mtime_ns: 1 },
+            ],
+        )
+        .unwrap();
+        let old = db.missing_previews().unwrap().into_iter().find(|id| db.get(*id).unwrap().rel == "old.jpg").unwrap();
+        db.set_decoded(old, "abc", 10, 10, "{}", "ab/abc.jpg").unwrap();
+        let order: Vec<_> = db.gallery(10).unwrap().into_iter().map(|item| item.rel).collect();
+        assert_eq!(order, vec!["old.jpg", "new.jpg"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
